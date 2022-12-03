@@ -1,0 +1,5 @@
+target
+.idea
+working_dir/*
+*.bak
+*.tar
