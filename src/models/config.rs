@@ -15,9 +15,10 @@ pub struct AppConfig {
 #[derive(Serialize, Deserialize)]
 #[derive(Clone)]
 pub struct ApiConfig {
-    pub zkill_history_url:String,
-    pub zkill_details_url:String,
-    pub ccp_details_url:String
+    pub zkill_history_url: String,
+    pub zkill_details_url: String,
+    pub ccp_details_url: String,
+    pub user_agent: String,
 }
 
 #[derive(Debug)]

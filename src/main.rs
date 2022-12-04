@@ -42,6 +42,8 @@ async fn main() {
     config_logging(&app_config.logging);
     info!("zkill-history-importer started");
 
+    let http_client = reqwest::Client::builder().user_agent(&app_config.api_config.user_agent).build().unwrap();
+
     let start_date = match &app_config.start_date {
         Some(value) => {
             match chrono::Utc.datetime_from_str(&value, "%Y-%m-%d") {
@@ -52,12 +54,12 @@ async fn main() {
         None => { chrono::Utc::now() }
     };
     let day_list = get_list_days(start_date, 0..=app_config.num_days);
-    let all_ids = get_ids_for_day(&day_list, &app_config.api_config.zkill_history_url).await;
-    println!("{:?}", all_ids);
-    upload_to_database(all_ids, &app_config).await;
+
+    let all_ids = get_ids_for_day(&day_list, &app_config.api_config.zkill_history_url, &http_client).await;
+    upload_to_database(all_ids, &app_config, &http_client).await;
 }
 
-async fn upload_to_database(killmails: Vec<(u64, String)>, app_config: &config::AppConfig) {
+async fn upload_to_database(killmails: Vec<(i64, String)>, app_config: &config::AppConfig, http_client: &reqwest::Client) {
     let client: mongodb::Client = match connect_to_db(&app_config.database.conn_string).await {
         Ok(client) => {
             client
@@ -85,39 +87,56 @@ async fn upload_to_database(killmails: Vec<(u64, String)>, app_config: &config::
             }
         }
     }
+    info!("Going through each kill in list to find missing");
+    info!("Num Found [{}]", killmails.len());
     for (id, hash) in killmails {
         let exists_already = is_in_collection(&id, &collection).await;
-        // if !exists_already {
-        let (ccp_value, zkb_value) = match get_kill_details(&id, &hash, &app_config.api_config.zkill_details_url, &app_config.api_config.zkill_details_url).await {
-            Ok(output) => { output }
-            Err(message) => {
-                error!("{0}", &message);
-                panic!("{0}", &message);
-            }
-        };
-        // write_to_db(ccp_value, zkb_value, &collection).await;
-        // }
-        break;
+        if !exists_already {
+            info!("Killmail not present in database. Pulling data from api ID[{0}]", id);
+            let killmail = match get_kill_details(&id, &hash, &app_config.api_config.zkill_details_url, &app_config.api_config.ccp_details_url, http_client).await {
+                Ok(output) => { output }
+                Err(message) => {
+                    error!("{0}", &message);
+                    panic!("{0}", &message);
+                }
+            };
+            match write_to_db(&killmail, &collection).await {
+                Ok(inserted_id) => {
+                    info!("Database: Document inserted");
+                    debug!("Database: Document inserted ID: [{0}]", inserted_id.inserted_id);
+                }
+                Err(error) => {
+                    error!("Database: Got error attempting to write to database message[{0}] [{1:?}]", &killmail, &error);
+                }
+            };
+            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+        } else {
+            info!("Killmail present in database skipping. ID[{0}]", id);
+        }
     }
 }
 
-async fn is_in_collection(id: &u64, collection: &mongodb::Collection<Bson>) -> bool {
-    return false;
+async fn is_in_collection(id: &i64, collection: &mongodb::Collection<Bson>) -> bool {
+    return match collection.find_one(doc! {"killmail_id": id}, None).await {
+        Ok(result) => {
+            match result {
+                None => { false }
+                Some(_) => { true }
+            }
+        }
+        Err(_) => { false }
+    };
 }
 
-async fn write_to_db(ccp_value: Bson, zkb_value: Bson, collection: &mongodb::Collection<Bson>) -> Result<mongodb::results::InsertOneResult, mongodb::error::Error> {
-    return collection.insert_one(ccp_value, None).await;
-}
-
-async fn get_kill_details(id: &u64, hash: &String, zkill_details_url: &String, ccp_details_url: &String) -> Result<(Bson, Bson), String> {
+async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, ccp_details_url: &String, http_client: &reqwest::Client) -> Result<(Document), String> {
     let zkill_api_url = format!("{0}{1}/", zkill_details_url, id);
-    println!("{}", &zkill_api_url);
-    let zkill_response = match reqwest::get(&zkill_api_url).await {
+    info!("Making request to {}", &zkill_api_url);
+    let zkill_response = match http_client.execute(http_client.get(&zkill_api_url).build().unwrap()).await {
         Ok(response) => {
             match response.text().await {
                 Ok(result) => {
                     if result.is_empty() {
-                        return Err(format!("zkillboard details: Empty repose"));
+                        return Err("zkillboard details: Empty response".to_string());
                     } else {
                         result
                     }
@@ -131,8 +150,21 @@ async fn get_kill_details(id: &u64, hash: &String, zkill_details_url: &String, c
             return Err(format!("zKillboard details: Got error sending api request. Url: {0} Error:{1}", &zkill_details_url, &error));
         }
     };
-    let ccp_api_url = format!("{0}/{1}/{2}/?datasource=tranquility", ccp_details_url, id, hash);
-    let ccp_response = match reqwest::get(&ccp_api_url).await {
+    let zkill_response_value: serde_json::Value = match serde_json::from_str(&zkill_response) {
+        Ok(value) => { value }
+        Err(error) => {
+            return Err(format!("zKillboard details: Response could not be parsed by serde_json [{0}] [{1:?}]", &zkill_response, error));
+        }
+    };
+    let zkill_bson_doc = match bson::to_document(&zkill_response_value.as_array().unwrap()[0]) {
+        Ok(value) => { value }
+        Err(error) => {
+            return Err(format!("zKillboard details: Response could not be parsed by bson [{0}] [{1:?}]", &zkill_response_value, error));
+        }
+    };
+    let ccp_api_url = format!("{0}{1}/{2}/?datasource=tranquility", ccp_details_url, id, hash);
+    info!("Making request to {}", &ccp_api_url);
+    let ccp_response = match http_client.execute(http_client.get(&ccp_api_url).build().unwrap()).await {
         Ok(response) => {
             match response.text().await {
                 Ok(result) => {
@@ -151,41 +183,31 @@ async fn get_kill_details(id: &u64, hash: &String, zkill_details_url: &String, c
             return Err(format!("CCP details: Got error sending api request. Url: {0} Error:{1}", &ccp_api_url, &error));
         }
     };
-    let mut zkill_response_value: serde_json::Value = match serde_json::from_str(&zkill_response) {
-        Ok(value) => { value }
-        Err(error) => {
-            return Err(format!("zKillboard details: Response could not be parsed by serde_json [{0}] [{1:?}]", &zkill_response, error));
-        }
-    };
     let mut ccp_response_value: serde_json::Value = match serde_json::from_str(&ccp_response) {
         Ok(value) => { value }
         Err(error) => {
             return Err(format!("CCP details: Response could not be parsed by serde_json [{0}] [{1:?}]", &ccp_response, error));
         }
     };
-    let zkill_bson_doc = match bson::to_bson(&zkill_response_value) {
-        Ok(value) => { value }
-        Err(error) => {
-            return Err(format!("zKillboard details: Response could not be parsed by bson [{0}] [{1:?}]", &zkill_response_value, error));
-        }
-    };
-    let cpp_bson_doc = match bson::to_bson(&ccp_response_value) {
+    let mut cpp_bson_doc = match bson::to_document(&ccp_response_value) {
         Ok(value) => { value }
         Err(error) => {
             return Err(format!("CCP details: Response could not be parsed by bson [{0}] [{1:?}]", &ccp_response, error));
         }
     };
-    return Ok((cpp_bson_doc, zkill_bson_doc));
+    cpp_bson_doc.extend(zkill_bson_doc);
+    return Ok(cpp_bson_doc);
 }
 
-async fn get_ids_for_day(day_list: &Vec<chrono::DateTime<chrono::Utc>>, base_url: &String) -> Vec<(u64, String)> {
+async fn get_ids_for_day(day_list: &Vec<chrono::DateTime<chrono::Utc>>, base_url: &String, http_client: &reqwest::Client) -> Vec<(i64, String)> {
+    info!("Getting zkill history for each day in the list. Num Days [{0}]", day_list.len());
     let mut output = Vec::new();
     for day in day_list {
         let api_formatted_date = day.format("%Y%m%d").to_string();
         let api_url = format!("{0}{1}.json", base_url, api_formatted_date);
-        let mut resp = match reqwest::get(&api_url).await {
+        let mut resp = match http_client.execute(http_client.get(&api_url).build().unwrap()).await {
             Ok(response) => {
-                match response.json::<std::collections::HashMap<u64, String>>().await {
+                match response.json::<std::collections::HashMap<i64, String>>().await {
                     Ok(result) => {
                         result
                     }
@@ -202,7 +224,6 @@ async fn get_ids_for_day(day_list: &Vec<chrono::DateTime<chrono::Utc>>, base_url
         };
 
         for (id, hash) in resp.drain() {
-            println!("{0}{1}", &id,&hash);
             output.push((id, hash));
         }
     }
@@ -219,6 +240,10 @@ fn get_list_days(start_date: chrono::DateTime<chrono::Utc>, day_range: RangeIncl
         output_list.push(date_time);
     }
     return output_list;
+}
+
+async fn write_to_db(ccp_value: &bson::document::Document, collection: &mongodb::Collection<Bson>) -> Result<mongodb::results::InsertOneResult, mongodb::error::Error> {
+    return collection.insert_one(bson::to_bson(ccp_value).unwrap(), None).await;
 }
 
 async fn ping_db(database: &Database) -> Result<Document, mongodb::error::Error> {
