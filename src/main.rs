@@ -119,14 +119,14 @@ async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_
                 match get_kill_details(&id, &hash, &app_config.api_config.zkill_details_url, &app_config.api_config.ccp_details_url, http_client).await {
                     Ok(output) => { break output; }
                     Err(message) => {
-                        if num_api_attempts > 10 {
-                            continue 'km_loop;
-                        } else {
+                        // if num_api_attempts > 10 {
+                             // continue 'km_loop;
+                        // } else {
                             num_api_attempts += 1;
                             error!("Got error getting api info. Sleeping 1 second before trying again. Attempt number [{0}] Error [{1}]", &num_api_attempts, &message);
                             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
                             continue;
-                        }
+                        // }
                     }
                 };
             };
