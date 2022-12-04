@@ -59,7 +59,9 @@ async fn main() {
         let day_list = get_encompassing_days(date_to_start_pulling_from, 0..=app_config.num_days);
 
         let all_ids = get_killmail_for_days(&day_list, &app_config.api_config.zkill_history_url, &http_client).await;
-        task_upload_to_database_if_missing(all_ids, &app_config, &http_client).await;
+
+        task_upload_to_database_if_missing(&all_ids, &app_config, &http_client).await;
+
         num_iterations += 1;
         let end_time = SystemTime::now();
         match execution_start_time.duration_since(end_time) {
@@ -79,14 +81,13 @@ async fn main() {
     }
 }
 
-async fn task_upload_to_database_if_missing(killmails: Vec<(i64, String)>, app_config: &config::AppConfig, http_client: &reqwest::Client) {
+async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_config: &config::AppConfig, http_client: &reqwest::Client) {
     let client: mongodb::Client = match get_database_client(&app_config.database_config.conn_string).await {
         Ok(client) => {
             client
         }
         Err(error) => {
-            error!("Database: Unable to create database client");
-            panic!("Database: Unable to create database client. Dont know how to proceed so panicking");
+            panic!("Database: Unable to create database client. {0:?}", error);
         }
     };
     let database = client.database(&app_config.database_config.database_name);
@@ -101,7 +102,7 @@ async fn task_upload_to_database_if_missing(killmails: Vec<(i64, String)>, app_c
                     error!("Database: Unable to ping. Reattempting... [{0:?}]", error);
                 }
             }
-            if (test_ping_successful) {
+            if test_ping_successful {
                 info!("Database: Connection established");
                 break;
             }
@@ -109,27 +110,39 @@ async fn task_upload_to_database_if_missing(killmails: Vec<(i64, String)>, app_c
     }
     info!("Found [{0}] kills Going through each kill in list to find missing", killmails.len());
     let mut num_uploaded = 0;
-    for (id, hash) in killmails {
+    'km_loop: for (id, hash) in killmails {
         let exists_already = is_in_collection(&id, &collection).await;
         if !exists_already {
             info!("Killmail not present in database. Pulling data from api ID[{0}]", id);
-            let killmail = match get_kill_details(&id, &hash, &app_config.api_config.zkill_details_url, &app_config.api_config.ccp_details_url, http_client).await {
-                Ok(output) => { output }
-                Err(message) => {
-                    error!("{0}", &message);
-                    panic!("{0}", &message);
-                }
+            let mut num_api_attempts: u64 = 0;
+            let killmail = loop {
+                match get_kill_details(&id, &hash, &app_config.api_config.zkill_details_url, &app_config.api_config.ccp_details_url, http_client).await {
+                    Ok(output) => { break output; }
+                    Err(message) => {
+                        if num_api_attempts > 10 {
+                            continue 'km_loop;
+                        } else {
+                            num_api_attempts += 1;
+                            error!("Got error getting api info. Sleeping 1 second before trying again. Attempt number [{0}] Error [{1}]", &num_api_attempts, &message);
+                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                            continue;
+                        }
+                    }
+                };
             };
-            match write_bson_to_database(&killmail, &collection).await {
-                Ok(inserted_id) => {
-                    info!("Database: Document inserted");
-                    debug!("Database: Document inserted ID: [{0}]", inserted_id.inserted_id);
-                    num_uploaded += 1;
-                }
-                Err(error) => {
-                    error!("Database: Got error attempting to write to database message[{0}] [{1:?}]", &killmail, &error);
-                }
-            };
+            loop {
+                match write_bson_to_database(&killmail, &collection).await {
+                    Ok(inserted_id) => {
+                        info!("Database: Document inserted");
+                        debug!("Database: Document inserted ID: [{0}]", inserted_id.inserted_id);
+                        num_uploaded += 1;
+                        break;
+                    }
+                    Err(error) => {
+                        error!("Database: Got error attempting to write to database message[{0}] [{1:?}]", &killmail, &error);
+                    }
+                };
+            }
             tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
         } else {
             info!("Killmail present in database skipping. ID[{0}]", id);

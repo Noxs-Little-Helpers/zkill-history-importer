@@ -1,17 +1,22 @@
 {
-  "websocket": {
-    "url": "wss://zkillboard.com/websocket/",
-    "sub_message": "{\"action\":\"sub\",\"channel\":\"killstream\"}",
-    "client_id": "nlh/kill-importer"
+  "num_days": 2,
+  "schedule_config": {
+    "hours_to_wait": 12
   },
-  "database": {
+  "api_config": {
+    "zkill_history_url": "https://zkillboard.com/api/history/",
+    "zkill_details_url": "https://zkillboard.com/api/killID/",
+    "ccp_details_url": "https://esi.evetech.net/latest/killmails/",
+    "user_agent": "NoxsLittleHelpers/HistoryImporter/Nox Amos/iamasb2@gmail.com/v0.1.0/"
+  },
+  "database_config": {
     "conn_string": "mongodb://nlh-mongo:27017",
-    "database_name": "kill",
-    "collection_name": "kill-importer"
+    "database_name": "noxslittlehelpers",
+    "collection_name": "zkillboard-imported-kills"
   },
-  "logging": {
+  "logging_config": {
     "dir": "./logs",
-    "active_file": "zkill-ws-importer.log",
-    "archive_pattern": "zkill-ws-importer_{}.log"
+    "active_file": "zkill-history-importer.log",
+    "archive_pattern": "zkill-history-importer_{}.log"
   }
 }
