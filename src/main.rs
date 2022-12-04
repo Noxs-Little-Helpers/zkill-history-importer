@@ -9,7 +9,6 @@ use std::{
     env,
     fs,
 };
-use std::future::Future;
 use std::ops::RangeInclusive;
 use chrono::TimeZone;
 use log4rs::{
@@ -18,7 +17,6 @@ use log4rs::{
             ConsoleAppender,
             Target,
         },
-        file::FileAppender,
         rolling_file::{
             policy::{
                 compound::CompoundPolicy,
@@ -28,39 +26,61 @@ use log4rs::{
             RollingFileAppender,
         },
     },
-    encode::{pattern::PatternEncoder, json::JsonEncoder},
+    encode::{json::JsonEncoder},
     config::{Appender, Config, Logger, Root},
     filter::threshold::ThresholdFilter,
 };
 use mongodb::bson::{Bson, doc, Document};
 use mongodb::{bson, Database};
-use crate::models::api;
+use std::time::{Duration, SystemTime, SystemTimeError};
 
 #[tokio::main]
 async fn main() {
-    let app_config: config::AppConfig = load_config();
-    config_logging(&app_config.logging);
+    let app_config: &config::AppConfig = &load_config_from_file();
+    config_logging(&app_config.logging_config);
     info!("zkill-history-importer started");
 
     let http_client = reqwest::Client::builder().user_agent(&app_config.api_config.user_agent).build().unwrap();
-
-    let start_date = match &app_config.start_date {
-        Some(value) => {
-            match chrono::Utc.datetime_from_str(&value, "%Y-%m-%d") {
-                Ok(value) => value,
-                Err(error) => panic!("Cannot parse start date string. [{0}]", error)
+    let mut num_iterations: u64 = 0;
+    loop {
+        let execution_start_time = SystemTime::now();
+        let date_to_start_pulling_from = match &app_config.start_date {
+            Some(value) => {
+                if app_config.schedule_config.is_some() {
+                    panic!("Config specifies start date while also specifying schedule config.");
+                }
+                match chrono::Utc.datetime_from_str(&value, "%Y-%m-%d") {
+                    Ok(value) => value,
+                    Err(error) => panic!("Cannot parse start date string. [{0}]", error)
+                }
             }
-        }
-        None => { chrono::Utc::now() }
-    };
-    let day_list = get_list_days(start_date, 0..=app_config.num_days);
+            None => { chrono::Utc::now() }
+        };
+        let day_list = get_encompassing_days(date_to_start_pulling_from, 0..=app_config.num_days);
 
-    let all_ids = get_ids_for_day(&day_list, &app_config.api_config.zkill_history_url, &http_client).await;
-    upload_to_database(all_ids, &app_config, &http_client).await;
+        let all_ids = get_killmail_for_days(&day_list, &app_config.api_config.zkill_history_url, &http_client).await;
+        task_upload_to_database_if_missing(all_ids, &app_config, &http_client).await;
+        num_iterations += 1;
+        let end_time = SystemTime::now();
+        match execution_start_time.duration_since(end_time) {
+            Ok(time_elapsed) => { info!("Completed task. Time elapsed [{0:?}]", time_elapsed); }
+            Err(_) => { info!("Completed task. Error calculating time elapsed"); }
+        };
+        match &app_config.schedule_config {
+            Some(some) => {
+                info!("Sleeping for [{0}] hours. Iteration# [{1}]", &some.hours_to_wait, num_iterations);
+                tokio::time::sleep(tokio::time::Duration::from_secs(&some.hours_to_wait * 60)).await;
+            }
+            None => {
+                info!("Stopping program");
+                break;
+            }
+        };
+    }
 }
 
-async fn upload_to_database(killmails: Vec<(i64, String)>, app_config: &config::AppConfig, http_client: &reqwest::Client) {
-    let client: mongodb::Client = match connect_to_db(&app_config.database.conn_string).await {
+async fn task_upload_to_database_if_missing(killmails: Vec<(i64, String)>, app_config: &config::AppConfig, http_client: &reqwest::Client) {
+    let client: mongodb::Client = match get_database_client(&app_config.database_config.conn_string).await {
         Ok(client) => {
             client
         }
@@ -69,13 +89,13 @@ async fn upload_to_database(killmails: Vec<(i64, String)>, app_config: &config::
             panic!("Database: Unable to create database client. Dont know how to proceed so panicking");
         }
     };
-    let database = client.database(&app_config.database.database_name);
-    let collection = database.collection(&app_config.database.collection_name);
+    let database = client.database(&app_config.database_config.database_name);
+    let collection = database.collection(&app_config.database_config.collection_name);
     {
         info!("Database: Attempting to connect");
         let mut test_ping_successful = false;
         loop {
-            match ping_db(&database).await {
+            match confirm_database_connection(&database).await {
                 Ok(document) => { test_ping_successful = true }
                 Err(error) => {
                     error!("Database: Unable to ping. Reattempting... [{0:?}]", error);
@@ -87,8 +107,8 @@ async fn upload_to_database(killmails: Vec<(i64, String)>, app_config: &config::
             }
         }
     }
-    info!("Going through each kill in list to find missing");
-    info!("Num Found [{}]", killmails.len());
+    info!("Found [{0}] kills Going through each kill in list to find missing", killmails.len());
+    let mut num_uploaded = 0;
     for (id, hash) in killmails {
         let exists_already = is_in_collection(&id, &collection).await;
         if !exists_already {
@@ -100,10 +120,11 @@ async fn upload_to_database(killmails: Vec<(i64, String)>, app_config: &config::
                     panic!("{0}", &message);
                 }
             };
-            match write_to_db(&killmail, &collection).await {
+            match write_bson_to_database(&killmail, &collection).await {
                 Ok(inserted_id) => {
                     info!("Database: Document inserted");
                     debug!("Database: Document inserted ID: [{0}]", inserted_id.inserted_id);
+                    num_uploaded += 1;
                 }
                 Err(error) => {
                     error!("Database: Got error attempting to write to database message[{0}] [{1:?}]", &killmail, &error);
@@ -114,6 +135,7 @@ async fn upload_to_database(killmails: Vec<(i64, String)>, app_config: &config::
             info!("Killmail present in database skipping. ID[{0}]", id);
         }
     }
+    info!("Task completed. Uploaded {0} documents", num_uploaded);
 }
 
 async fn is_in_collection(id: &i64, collection: &mongodb::Collection<Bson>) -> bool {
@@ -199,7 +221,7 @@ async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, c
     return Ok(cpp_bson_doc);
 }
 
-async fn get_ids_for_day(day_list: &Vec<chrono::DateTime<chrono::Utc>>, base_url: &String, http_client: &reqwest::Client) -> Vec<(i64, String)> {
+async fn get_killmail_for_days(day_list: &Vec<chrono::DateTime<chrono::Utc>>, base_url: &String, http_client: &reqwest::Client) -> Vec<(i64, String)> {
     info!("Getting zkill history for each day in the list. Num Days [{0}]", day_list.len());
     let mut output = Vec::new();
     for day in day_list {
@@ -230,7 +252,7 @@ async fn get_ids_for_day(day_list: &Vec<chrono::DateTime<chrono::Utc>>, base_url
     return output;
 }
 
-fn get_list_days(start_date: chrono::DateTime<chrono::Utc>, day_range: RangeInclusive<u64>) -> Vec<chrono::DateTime<chrono::Utc>> {
+fn get_encompassing_days(start_date: chrono::DateTime<chrono::Utc>, day_range: RangeInclusive<u64>) -> Vec<chrono::DateTime<chrono::Utc>> {
     let mut output_list = Vec::new();
     for num_days in day_range {
         let mut date_time = match start_date.checked_sub_days(chrono::Days::new(num_days)) {
@@ -242,21 +264,21 @@ fn get_list_days(start_date: chrono::DateTime<chrono::Utc>, day_range: RangeIncl
     return output_list;
 }
 
-async fn write_to_db(ccp_value: &bson::document::Document, collection: &mongodb::Collection<Bson>) -> Result<mongodb::results::InsertOneResult, mongodb::error::Error> {
+async fn write_bson_to_database(ccp_value: &bson::document::Document, collection: &mongodb::Collection<Bson>) -> Result<mongodb::results::InsertOneResult, mongodb::error::Error> {
     return collection.insert_one(bson::to_bson(ccp_value).unwrap(), None).await;
 }
 
-async fn ping_db(database: &Database) -> Result<Document, mongodb::error::Error> {
+async fn confirm_database_connection(database: &Database) -> Result<Document, mongodb::error::Error> {
     return database
         .run_command(doc! {"ping": 1}, None).await;
 }
 
-async fn connect_to_db(connect_addr: &String) -> mongodb::error::Result<mongodb::Client> {
+async fn get_database_client(connect_addr: &String) -> mongodb::error::Result<mongodb::Client> {
     let mut client_options = mongodb::options::ClientOptions::parse(connect_addr).await?;
     return mongodb::Client::with_options(client_options);
 }
 
-fn load_config() -> config::AppConfig {
+fn load_config_from_file() -> config::AppConfig {
     let args: Vec<String> = env::args().collect();
     let config_loc = match args.get(1) {
         Some(loc) => {
