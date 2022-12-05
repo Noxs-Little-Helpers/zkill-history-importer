@@ -64,7 +64,7 @@ async fn main() {
 
         num_iterations += 1;
         let end_time = SystemTime::now();
-        match execution_start_time.duration_since(end_time) {
+        match end_time.duration_since(execution_start_time) {
             Ok(time_elapsed) => { info!("Completed task. Time elapsed [{0:?}]", time_elapsed); }
             Err(_) => { info!("Completed task. Error calculating time elapsed"); }
         };
@@ -120,12 +120,12 @@ async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_
                     Ok(output) => { break output; }
                     Err(message) => {
                         // if num_api_attempts > 10 {
-                             // continue 'km_loop;
+                        // continue 'km_loop;
                         // } else {
-                            num_api_attempts += 1;
-                            error!("Got error getting api info. Sleeping 1 second before trying again. Attempt number [{0}] Error [{1}]", &num_api_attempts, &message);
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                            continue;
+                        num_api_attempts += 1;
+                        error!("Got error getting api info. Sleeping 1 second before trying again. Attempt number [{0}] Error [{1}]", &num_api_attempts, &message);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        continue;
                         // }
                     }
                 };
@@ -327,7 +327,7 @@ fn config_logging(logging_config: &config::LoggingConfig) {
         .encoder(Box::new(JsonEncoder::new()))
         .build(&active_log,
                Box::new(CompoundPolicy::new(
-                   Box::new(SizeTrigger::new(10 * 1024 * 1024)),
+                   Box::new(SizeTrigger::new(500 * 1024 * 1024)),
                    Box::new(FixedWindowRoller::builder().build(&archive_patter, 10).unwrap()),
                )))
         .unwrap();
