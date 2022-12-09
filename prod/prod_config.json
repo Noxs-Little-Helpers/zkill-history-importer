@@ -11,8 +11,8 @@
   },
   "database_config": {
     "conn_string": "mongodb://nlh-mongo:27017",
-    "database_name": "noxslittlehelpers",
-    "collection_name": "zkillboard-imported-kills"
+    "database_name": "eve-stats-and-battle-reports",
+    "collection_name": "killmails"
   },
   "logging_config": {
     "dir": "./logs",
