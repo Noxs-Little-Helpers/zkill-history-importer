@@ -1,7 +1,7 @@
 mod models;
 
 use models::{
-    config,
+    app_config,
 };
 use log::{error, info, warn, LevelFilter, debug};
 
@@ -36,7 +36,7 @@ use std::time::{Duration, SystemTime, SystemTimeError};
 
 #[tokio::main]
 async fn main() {
-    let app_config: &config::AppConfig = &load_config_from_file();
+    let app_config: &app_config::AppConfig = &load_config_from_file();
     config_logging(&app_config.logging_config);
     info!("zkill-history-importer started");
 
@@ -81,7 +81,7 @@ async fn main() {
     }
 }
 
-async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_config: &config::AppConfig, http_client: &reqwest::Client) {
+async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_config: &app_config::AppConfig, http_client: &reqwest::Client) {
     let client: mongodb::Client = match get_database_client(&app_config.database_config.conn_string).await {
         Ok(client) => {
             client
@@ -291,7 +291,7 @@ async fn get_database_client(connect_addr: &String) -> mongodb::error::Result<mo
     return mongodb::Client::with_options(client_options);
 }
 
-fn load_config_from_file() -> config::AppConfig {
+fn load_config_from_file() -> app_config::AppConfig {
     let args: Vec<String> = env::args().collect();
     let config_loc = match args.get(1) {
         Some(loc) => {
@@ -301,13 +301,18 @@ fn load_config_from_file() -> config::AppConfig {
             panic!("Config file not specified in first argument");
         }
     };
-    let contents = fs::read_to_string(config_loc)
-        .expect(&format!("Cannot open config file {0}", config_loc));
-    let model: config::AppConfig = serde_json::from_str(&contents).unwrap();
-    return model;
+
+    let imported_config = config::Config::builder()
+        .add_source(config::File::with_name(config_loc))
+        .add_source(config::Environment::with_prefix("NLH"))
+        .build()
+        .unwrap();
+    return imported_config
+        .try_deserialize::<app_config::AppConfig>()
+        .unwrap();
 }
 
-fn config_logging(logging_config: &config::LoggingConfig) {
+fn config_logging(logging_config: &app_config::LoggingConfig) {
     let mut active_log = String::new();
     {
         active_log.push_str(&logging_config.dir);
