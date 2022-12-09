@@ -3,11 +3,10 @@ mod models;
 use models::{
     app_config,
 };
-use log::{error, info, warn, LevelFilter, debug};
+use log::{error, info, LevelFilter, debug};
 
 use std::{
     env,
-    fs,
 };
 use std::ops::RangeInclusive;
 use chrono::TimeZone;
@@ -27,12 +26,12 @@ use log4rs::{
         },
     },
     encode::{json::JsonEncoder},
-    config::{Appender, Config, Logger, Root},
+    config::{Appender, Config,  Root},
     filter::threshold::ThresholdFilter,
 };
 use mongodb::bson::{Bson, doc, Document};
 use mongodb::{bson, Database};
-use std::time::{Duration, SystemTime, SystemTimeError};
+use std::time::{ SystemTime};
 
 #[tokio::main]
 async fn main() {
@@ -97,7 +96,7 @@ async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_
         let mut test_ping_successful = false;
         loop {
             match confirm_database_connection(&database).await {
-                Ok(document) => { test_ping_successful = true }
+                Ok(_) => { test_ping_successful = true }
                 Err(error) => {
                     error!("Database: Unable to ping. Reattempting... [{0:?}]", error);
                 }
@@ -110,7 +109,7 @@ async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_
     }
     info!("Found [{0}] kills Going through each kill in list to find missing", killmails.len());
     let mut num_uploaded = 0;
-    'km_loop: for (id, hash) in killmails {
+    for (id, hash) in killmails {
         let exists_already = is_in_collection(&id, &collection).await;
         if !exists_already {
             info!("Killmail not present in database. Pulling data from api ID[{0}]", id);
@@ -163,7 +162,7 @@ async fn is_in_collection(id: &i64, collection: &mongodb::Collection<Bson>) -> b
     };
 }
 
-async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, ccp_details_url: &String, http_client: &reqwest::Client) -> Result<(Document), String> {
+async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, ccp_details_url: &String, http_client: &reqwest::Client) -> Result<Document, String> {
     let zkill_api_url = format!("{0}{1}/", zkill_details_url, id);
     info!("Making request to {}", &zkill_api_url);
     let zkill_response = match http_client.execute(http_client.get(&zkill_api_url).build().unwrap()).await {
@@ -218,7 +217,7 @@ async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, c
             return Err(format!("CCP details: Got error sending api request. Url: {0} Error:{1}", &ccp_api_url, &error));
         }
     };
-    let mut ccp_response_value: serde_json::Value = match serde_json::from_str(&ccp_response) {
+    let ccp_response_value: serde_json::Value = match serde_json::from_str(&ccp_response) {
         Ok(value) => { value }
         Err(error) => {
             return Err(format!("CCP details: Response could not be parsed by serde_json [{0}] [{1:?}]", &ccp_response, error));
@@ -268,7 +267,7 @@ async fn get_killmail_for_days(day_list: &Vec<chrono::DateTime<chrono::Utc>>, ba
 fn get_encompassing_days(start_date: chrono::DateTime<chrono::Utc>, day_range: RangeInclusive<u64>) -> Vec<chrono::DateTime<chrono::Utc>> {
     let mut output_list = Vec::new();
     for num_days in day_range {
-        let mut date_time = match start_date.checked_sub_days(chrono::Days::new(num_days)) {
+        let date_time = match start_date.checked_sub_days(chrono::Days::new(num_days)) {
             Some(result) => { result }
             None => panic!("Cannot determine days to import")
         };
@@ -287,7 +286,7 @@ async fn confirm_database_connection(database: &Database) -> Result<Document, mo
 }
 
 async fn get_database_client(connect_addr: &String) -> mongodb::error::Result<mongodb::Client> {
-    let mut client_options = mongodb::options::ClientOptions::parse(connect_addr).await?;
+    let client_options = mongodb::options::ClientOptions::parse(connect_addr).await?;
     return mongodb::Client::with_options(client_options);
 }
 
