@@ -9,7 +9,6 @@ use std::{
     env,
 };
 use std::ops::RangeInclusive;
-use chrono::TimeZone;
 use log4rs::{
     append::{
         console::{
@@ -26,12 +25,13 @@ use log4rs::{
         },
     },
     encode::{json::JsonEncoder},
-    config::{Appender, Config,  Root},
+    config::{Appender, Config, Root},
     filter::threshold::ThresholdFilter,
 };
 use mongodb::bson::{Bson, doc, Document};
 use mongodb::{bson, Database};
-use std::time::{ SystemTime};
+use std::time::{SystemTime};
+use chrono::TimeZone;
 
 #[tokio::main]
 async fn main() {
@@ -48,13 +48,15 @@ async fn main() {
                 if app_config.schedule_config.is_some() {
                     panic!("Config specifies start date while also specifying schedule config.");
                 }
-                match chrono::Utc.datetime_from_str(&value, "%Y-%m-%d") {
-                    Ok(value) => value,
-                    Err(error) => panic!("Cannot parse start date string. [{0}]", error)
+                match chrono::Utc.with_ymd_and_hms(value.year, value.month, value.day, 0, 0, 0) {
+                    chrono::LocalResult::Single(value) => value,
+                    chrono::LocalResult::None => panic!("Cannot parse start date. Are you sure you entered year month and day correctly?"),
+                    chrono::LocalResult::Ambiguous(_,_) => panic!("Cannot parse start date. Result is ambiguous"),
                 }
             }
             None => { chrono::Utc::now() }
         };
+        info!("Pull Start Date [{0}]", &date_to_start_pulling_from);
         let day_list = get_encompassing_days(date_to_start_pulling_from, 0..=app_config.num_days);
 
         let all_ids = get_killmail_for_days(&day_list, &app_config.api_config.zkill_history_url, &http_client).await;
@@ -119,12 +121,12 @@ async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_
                     Ok(output) => { break output; }
                     Err(message) => {
                         // if num_api_attempts > 10 {
-                             // continue 'km_loop;
+                        // continue 'km_loop;
                         // } else {
-                            num_api_attempts += 1;
-                            error!("Got error getting api info. Sleeping 1 second before trying again. Attempt number [{0}] Error [{1}]", &num_api_attempts, &message);
-                            tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
-                            continue;
+                        num_api_attempts += 1;
+                        error!("Got error getting api info. Sleeping 1 second before trying again. Attempt number [{0}] Error [{1}]", &num_api_attempts, &message);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(1000)).await;
+                        continue;
                         // }
                     }
                 };
