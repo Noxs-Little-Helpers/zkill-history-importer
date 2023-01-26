@@ -1,22 +1,20 @@
 {
   "num_days": 2,
-  "schedule_config": {
+  "scheduling": {
     "hours_to_wait": 12
   },
-  "api_config": {
+  "api": {
     "zkill_history_url": "https://zkillboard.com/api/history/",
     "zkill_details_url": "https://zkillboard.com/api/killID/",
     "ccp_details_url": "https://esi.evetech.net/latest/killmails/",
     "user_agent": "NoxsLittleHelpers/HistoryImporter/Nox Amos/iamasb2@gmail.com/v0.1.0/"
   },
-  "database_config": {
+  "database": {
     "conn_string": "mongodb://nlh-mongo:27017",
     "database_name": "eve-stats-and-battle-reports",
     "collection_name": "killmails"
   },
-  "logging_config": {
-    "dir": "./logs",
-    "active_file": "zkill-history-importer.log",
-    "archive_pattern": "zkill-history-importer_{}.log"
+  "logging": {
+    "logging_level": "DEBUG"
   }
 }
