@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone)]
 pub struct AppConfig {
     pub num_days: u64,
-    pub start_date: Option<String>,
-    pub schedule_config: Option<ScheduleConfig>,
-    pub api_config: ApiConfig,
-    pub database_config: DatabaseConfig,
-    pub logging_config: LoggingConfig,
+    pub start_date: Option<StartDateConfig>,
+    pub scheduling: Option<ScheduleConfig>,
+    pub api: ApiConfig,
+    pub database: DatabaseConfig,
+    pub logging: Option<LoggingConfig>,
 }
 
 #[derive(Debug)]
@@ -17,6 +17,15 @@ pub struct AppConfig {
 #[derive(Clone)]
 pub struct ScheduleConfig {
     pub hours_to_wait: u64,
+}
+
+#[derive(Debug)]
+#[derive(Serialize, Deserialize)]
+#[derive(Clone)]
+pub struct StartDateConfig {
+    pub year: i32,
+    pub month: u32,
+    pub day: u32,
 }
 
 #[derive(Debug)]
@@ -42,7 +51,5 @@ pub struct DatabaseConfig {
 #[derive(Serialize, Deserialize)]
 #[derive(Clone)]
 pub struct LoggingConfig {
-    pub dir: String,
-    pub active_file: String,
-    pub archive_pattern: String,
+    pub logging_level: String,
 }

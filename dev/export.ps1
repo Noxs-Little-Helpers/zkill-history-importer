@@ -1,1 +1,1 @@
-docker export zkill-ws-importer -o ./zkill-ws-importer-fs.tar
+docker export zkill-ws-history -o ./zkill-ws-history-fs.tar

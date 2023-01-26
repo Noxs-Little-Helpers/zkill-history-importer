@@ -1,64 +1,58 @@
 mod models;
 
 use models::{
-    config,
+    app_config,
 };
-use log::{error, info, warn, LevelFilter, debug};
+use tracing::{error, info, warn, debug, trace, Level};
+use tracing_subscriber::FmtSubscriber;
 
 use std::{
     env,
-    fs,
+    str::FromStr
 };
 use std::ops::RangeInclusive;
-use chrono::TimeZone;
-use log4rs::{
-    append::{
-        console::{
-            ConsoleAppender,
-            Target,
-        },
-        rolling_file::{
-            policy::{
-                compound::CompoundPolicy,
-                compound::roll::fixed_window::FixedWindowRoller,
-                compound::trigger::size::SizeTrigger,
-            },
-            RollingFileAppender,
-        },
-    },
-    encode::{json::JsonEncoder},
-    config::{Appender, Config, Logger, Root},
-    filter::threshold::ThresholdFilter,
-};
 use mongodb::bson::{Bson, doc, Document};
 use mongodb::{bson, Database};
-use std::time::{Duration, SystemTime, SystemTimeError};
+use std::time::{SystemTime};
+use chrono::TimeZone;
 
 #[tokio::main]
 async fn main() {
-    let app_config: &config::AppConfig = &load_config_from_file();
-    config_logging(&app_config.logging_config);
+    let app_config: &app_config::AppConfig = &load_config_from_file();
+    config_logging(match &app_config.logging {
+        None => { Level::INFO }
+        Some(logging_config) => {
+            match Level::from_str(&logging_config.logging_level.as_str()) {
+                Err(e) => {
+                    panic!("Invalid logging level supplied in config. Supplied value [{0}] Error [{1:?}]", &logging_config.logging_level, e);
+                }
+                Ok(level) => { level }
+            }
+        }
+    });
     info!("zkill-history-importer started");
 
-    let http_client = reqwest::Client::builder().user_agent(&app_config.api_config.user_agent).build().unwrap();
+    let http_client = reqwest::Client::builder().user_agent(&app_config.api.user_agent).build().unwrap();
     let mut num_iterations: u64 = 0;
     loop {
         let execution_start_time = SystemTime::now();
         let date_to_start_pulling_from = match &app_config.start_date {
             Some(value) => {
-                if app_config.schedule_config.is_some() {
+                if app_config.scheduling.is_some() {
                     panic!("Config specifies start date while also specifying schedule config.");
                 }
-                match chrono::Utc.datetime_from_str(&value, "%Y-%m-%d") {
-                    Ok(value) => value,
-                    Err(error) => panic!("Cannot parse start date string. [{0}]", error)
+                match chrono::Utc.with_ymd_and_hms(value.year, value.month, value.day, 0, 0, 0) {
+                    chrono::LocalResult::Single(value) => value,
+                    chrono::LocalResult::None => panic!("Cannot parse start date. Are you sure you entered year month and day correctly?"),
+                    chrono::LocalResult::Ambiguous(_,_) => panic!("Cannot parse start date. Result is ambiguous"),
                 }
             }
             None => { chrono::Utc::now() }
         };
+        info!("Pull Start Date [{0}]", &date_to_start_pulling_from);
         let day_list = get_encompassing_days(date_to_start_pulling_from, 0..=app_config.num_days);
 
-        let all_ids = get_killmail_for_days(&day_list, &app_config.api_config.zkill_history_url, &http_client).await;
+        let all_ids = get_killmail_for_days(&day_list, &app_config.api.zkill_history_url, &http_client).await;
 
         task_upload_to_database_if_missing(&all_ids, &app_config, &http_client).await;
 
@@ -68,7 +62,7 @@ async fn main() {
             Ok(time_elapsed) => { info!("Completed task. Time elapsed [{0:?}]", time_elapsed); }
             Err(_) => { info!("Completed task. Error calculating time elapsed"); }
         };
-        match &app_config.schedule_config {
+        match &app_config.scheduling {
             Some(some) => {
                 info!("Sleeping for [{0}] hours. Iteration# [{1}]", &some.hours_to_wait, num_iterations);
                 tokio::time::sleep(tokio::time::Duration::from_secs(&some.hours_to_wait * 60)).await;
@@ -81,8 +75,9 @@ async fn main() {
     }
 }
 
-async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_config: &config::AppConfig, http_client: &reqwest::Client) {
-    let client: mongodb::Client = match get_database_client(&app_config.database_config.conn_string).await {
+#[tracing::instrument]
+async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_config: &app_config::AppConfig, http_client: &reqwest::Client) {
+    let client: mongodb::Client = match get_database_client(&app_config.database.conn_string).await {
         Ok(client) => {
             client
         }
@@ -90,14 +85,14 @@ async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_
             panic!("Database: Unable to create database client. {0:?}", error);
         }
     };
-    let database = client.database(&app_config.database_config.database_name);
-    let collection = database.collection(&app_config.database_config.collection_name);
+    let database = client.database(&app_config.database.database_name);
+    let collection = database.collection(&app_config.database.collection_name);
     {
         info!("Database: Attempting to connect");
         let mut test_ping_successful = false;
         loop {
             match confirm_database_connection(&database).await {
-                Ok(document) => { test_ping_successful = true }
+                Ok(_) => { test_ping_successful = true }
                 Err(error) => {
                     error!("Database: Unable to ping. Reattempting... [{0:?}]", error);
                 }
@@ -110,13 +105,13 @@ async fn task_upload_to_database_if_missing(killmails: &Vec<(i64, String)>, app_
     }
     info!("Found [{0}] kills Going through each kill in list to find missing", killmails.len());
     let mut num_uploaded = 0;
-    'km_loop: for (id, hash) in killmails {
+    for (id, hash) in killmails {
         let exists_already = is_in_collection(&id, &collection).await;
         if !exists_already {
             info!("Killmail not present in database. Pulling data from api ID[{0}]", id);
             let mut num_api_attempts: u64 = 0;
             let killmail = loop {
-                match get_kill_details(&id, &hash, &app_config.api_config.zkill_details_url, &app_config.api_config.ccp_details_url, http_client).await {
+                match get_kill_details(&id, &hash, &app_config.api.zkill_details_url, &app_config.api.ccp_details_url, http_client).await {
                     Ok(output) => { break output; }
                     Err(message) => {
                         // if num_api_attempts > 10 {
@@ -163,7 +158,7 @@ async fn is_in_collection(id: &i64, collection: &mongodb::Collection<Bson>) -> b
     };
 }
 
-async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, ccp_details_url: &String, http_client: &reqwest::Client) -> Result<(Document), String> {
+async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, ccp_details_url: &String, http_client: &reqwest::Client) -> Result<Document, String> {
     let zkill_api_url = format!("{0}{1}/", zkill_details_url, id);
     info!("Making request to {}", &zkill_api_url);
     let zkill_response = match http_client.execute(http_client.get(&zkill_api_url).build().unwrap()).await {
@@ -218,7 +213,7 @@ async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, c
             return Err(format!("CCP details: Got error sending api request. Url: {0} Error:{1}", &ccp_api_url, &error));
         }
     };
-    let mut ccp_response_value: serde_json::Value = match serde_json::from_str(&ccp_response) {
+    let ccp_response_value: serde_json::Value = match serde_json::from_str(&ccp_response) {
         Ok(value) => { value }
         Err(error) => {
             return Err(format!("CCP details: Response could not be parsed by serde_json [{0}] [{1:?}]", &ccp_response, error));
@@ -234,6 +229,7 @@ async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, c
     return Ok(cpp_bson_doc);
 }
 
+#[tracing::instrument]
 async fn get_killmail_for_days(day_list: &Vec<chrono::DateTime<chrono::Utc>>, base_url: &String, http_client: &reqwest::Client) -> Vec<(i64, String)> {
     info!("Getting zkill history for each day in the list. Num Days [{0}]", day_list.len());
     let mut output = Vec::new();
@@ -268,7 +264,7 @@ async fn get_killmail_for_days(day_list: &Vec<chrono::DateTime<chrono::Utc>>, ba
 fn get_encompassing_days(start_date: chrono::DateTime<chrono::Utc>, day_range: RangeInclusive<u64>) -> Vec<chrono::DateTime<chrono::Utc>> {
     let mut output_list = Vec::new();
     for num_days in day_range {
-        let mut date_time = match start_date.checked_sub_days(chrono::Days::new(num_days)) {
+        let date_time = match start_date.checked_sub_days(chrono::Days::new(num_days)) {
             Some(result) => { result }
             None => panic!("Cannot determine days to import")
         };
@@ -287,11 +283,11 @@ async fn confirm_database_connection(database: &Database) -> Result<Document, mo
 }
 
 async fn get_database_client(connect_addr: &String) -> mongodb::error::Result<mongodb::Client> {
-    let mut client_options = mongodb::options::ClientOptions::parse(connect_addr).await?;
+    let client_options = mongodb::options::ClientOptions::parse(connect_addr).await?;
     return mongodb::Client::with_options(client_options);
 }
 
-fn load_config_from_file() -> config::AppConfig {
+fn load_config_from_file() -> app_config::AppConfig {
     let args: Vec<String> = env::args().collect();
     let config_loc = match args.get(1) {
         Some(loc) => {
@@ -301,53 +297,20 @@ fn load_config_from_file() -> config::AppConfig {
             panic!("Config file not specified in first argument");
         }
     };
-    let contents = fs::read_to_string(config_loc)
-        .expect(&format!("Cannot open config file {0}", config_loc));
-    let model: config::AppConfig = serde_json::from_str(&contents).unwrap();
-    return model;
+
+    let imported_config = config::Config::builder()
+        .add_source(config::File::with_name(config_loc))
+        .add_source(config::Environment::with_prefix("NLH"))
+        .build()
+        .unwrap();
+    return imported_config
+        .try_deserialize::<app_config::AppConfig>()
+        .unwrap();
 }
-
-fn config_logging(logging_config: &config::LoggingConfig) {
-    let mut active_log = String::new();
-    {
-        active_log.push_str(&logging_config.dir);
-        active_log.push_str("/");
-        active_log.push_str(&logging_config.active_file);
-    }
-    let mut archive_patter = String::new();
-    {
-        archive_patter.push_str(&logging_config.dir);
-        archive_patter.push_str("/");
-        archive_patter.push_str(&logging_config.archive_pattern);
-    }
-    let log_to_stdout = ConsoleAppender::builder().target(Target::Stdout)
-        .build();
-    // Build a file logger.
-    let log_to_file = RollingFileAppender::builder()
-        .encoder(Box::new(JsonEncoder::new()))
-        .build(&active_log,
-               Box::new(CompoundPolicy::new(
-                   Box::new(SizeTrigger::new(500 * 1024 * 1024)),
-                   Box::new(FixedWindowRoller::builder().build(&archive_patter, 10).unwrap()),
-               )))
-        .unwrap();
-
-    // Log Debug level output to file where debug is the default level
-    // and the programmatically specified level to stderr.
-    let config = Config::builder()
-        .appender(Appender::builder().build("log_to_file", Box::new(log_to_file)))
-        .appender(
-            Appender::builder()
-                .filter(Box::new(ThresholdFilter::new(log::LevelFilter::Info)))
-                .build("log_to_stdout", Box::new(log_to_stdout)),
-        )
-        .build(
-            Root::builder()
-                .appender("log_to_file")
-                .appender("log_to_stdout")
-                .build(LevelFilter::Debug),
-        )
-        .unwrap();
-
-    log4rs::init_config(config).unwrap();
+fn config_logging(logging_level: Level) {
+    let subscriber = FmtSubscriber::builder()
+        .with_max_level(logging_level)
+        .finish();
+    tracing::subscriber::set_global_default(subscriber)
+        .expect("Setting default logging subscriber failed");
 }
