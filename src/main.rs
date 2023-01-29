@@ -8,7 +8,7 @@ use tracing_subscriber::FmtSubscriber;
 
 use std::{
     env,
-    str::FromStr
+    str::FromStr,
 };
 use std::ops::RangeInclusive;
 use mongodb::bson::{Bson, doc, Document};
@@ -44,7 +44,7 @@ async fn main() {
                 match chrono::Utc.with_ymd_and_hms(value.year, value.month, value.day, 0, 0, 0) {
                     chrono::LocalResult::Single(value) => value,
                     chrono::LocalResult::None => panic!("Cannot parse start date. Are you sure you entered year month and day correctly?"),
-                    chrono::LocalResult::Ambiguous(_,_) => panic!("Cannot parse start date. Result is ambiguous"),
+                    chrono::LocalResult::Ambiguous(_, _) => panic!("Cannot parse start date. Result is ambiguous"),
                 }
             }
             None => { chrono::Utc::now() }
@@ -163,6 +163,9 @@ async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, c
     info!("Making request to {}", &zkill_api_url);
     let zkill_response = match http_client.execute(http_client.get(&zkill_api_url).build().unwrap()).await {
         Ok(response) => {
+            if !response.status().is_success() {
+                return Err(format!("zkillboard details: Non 2xx response {0}", response.status().as_u16()));
+            }
             match response.text().await {
                 Ok(result) => {
                     if result.is_empty() {
@@ -196,6 +199,9 @@ async fn get_kill_details(id: &i64, hash: &String, zkill_details_url: &String, c
     info!("Making request to {}", &ccp_api_url);
     let ccp_response = match http_client.execute(http_client.get(&ccp_api_url).build().unwrap()).await {
         Ok(response) => {
+            if !response.status().is_success() {
+                return Err(format!("CCP details: Non 2xx response {0}", response.status().as_u16()));
+            }
             match response.text().await {
                 Ok(result) => {
                     if result.is_empty() {
@@ -307,6 +313,7 @@ fn load_config_from_file() -> app_config::AppConfig {
         .try_deserialize::<app_config::AppConfig>()
         .unwrap();
 }
+
 fn config_logging(logging_level: Level) {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(logging_level)
