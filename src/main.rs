@@ -317,6 +317,7 @@ fn load_config_from_file() -> app_config::AppConfig {
 fn config_logging(logging_level: Level) {
     let subscriber = FmtSubscriber::builder()
         .with_max_level(logging_level)
+        .json()
         .finish();
     tracing::subscriber::set_global_default(subscriber)
         .expect("Setting default logging subscriber failed");

@@ -15,6 +15,6 @@
     "collection_name": "killmails"
   },
   "logging": {
-    "logging_level": "DEBUG"
+    "logging_level": "INFO"
   }
 }
